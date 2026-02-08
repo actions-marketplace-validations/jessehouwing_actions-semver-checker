@@ -8,7 +8,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  # contents: write is required to see draft releases via the API
+  # Without it, draft releases are not visible and will be reported as "missing"
+  contents: write
 
 jobs:
   check-semver:
@@ -17,12 +19,13 @@ jobs:
       cancel-in-progress: true
       
     runs-on: ubuntu-latest
-    
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-        with:
-          fetch-depth: 0
-
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./
         with:
-          check-minor-version: true
+          check-minor-version: error
+          check-release-immutability: error
+          ignore-preview-releases: true
+          check-releases: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          auto-fix: true

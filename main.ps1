@@ -1,221 +1,230 @@
-$global:returnCode = 0
+﻿#############################################################################
+# Actions SemVer Checker - Main Script
+#############################################################################
+# This script validates semantic version tags and branches in a GitHub
+# repository to ensure proper version management for GitHub Actions.
+#
+# Key responsibilities:
+# 1. Validate that floating versions (v1, v1.0) point to correct patches
+# 2. Check that releases exist and are immutable
+# 3. Detect ambiguous refs (both tag and branch for same version)
+# 4. Auto-fix issues when enabled (requires contents: write permission)
+#############################################################################
 
-$warnMinor = (${env:INPUT_CHECK-MINOR-VERSION} ?? "true").Trim() -eq "true"
+# NOTE: Enable strict mode during development for better error detection:
+# Set-StrictMode -Version Latest
+# Disabled by default to avoid breaking existing test infrastructure.
 
-$tags = & git tag -l v* | Where-Object{ return ($_ -match "v\d+(.\d+)*$") }
+#############################################################################
+# MODULE IMPORTS
+#############################################################################
 
-$branches = & git branch --list --quiet --remotes | Where-Object{ return ($_.Trim() -match "^origin/(v\d+(.\d+)*(-.*)?)$") } | ForEach-Object{ $_.Trim().Replace("origin/", "")}
+. "$PSScriptRoot/lib/StateModel.ps1"
+. "$PSScriptRoot/lib/Logging.ps1"
+. "$PSScriptRoot/lib/VersionParser.ps1"
+. "$PSScriptRoot/lib/GitHubApi.ps1"
+. "$PSScriptRoot/lib/RemediationActions.ps1"
+. "$PSScriptRoot/lib/Remediation.ps1"
+. "$PSScriptRoot/lib/rules/releases/ReleaseRulesHelper.ps1"
+. "$PSScriptRoot/lib/rules/marketplace/MarketplaceRulesHelper.ps1"
+. "$PSScriptRoot/lib/ValidationRules.ps1"
+. "$PSScriptRoot/lib/InputValidation.ps1"
 
-$tagVersions = @()
-$branchVersions = @()
+#############################################################################
+# GLOBAL STATE
+#############################################################################
 
-$suggestedCommands = @()
+# Initialize repository state using the shared initialization function
+# This handles API URLs, token, and repository parsing from environment variables
+$script:State = Initialize-RepositoryState -MaskToken $true
 
-function write-actions-error
-{
-    param(
-        [string] $message
-    )
+# If repository could not be determined, warn user to configure GITHUB_REPOSITORY
+if (-not $script:State.RepoOwner -or -not $script:State.RepoName) {
+    Write-Host "::warning::Could not determine repository owner/name. Ensure GITHUB_REPOSITORY environment variable is set."
+}
 
-    write-output $message
+#############################################################################
+# INPUT PARSING AND VALIDATION
+#############################################################################
+
+# Parse and validate inputs using InputValidation module
+$inputConfig = Read-ActionInput -State $script:State
+if (-not $inputConfig) {
+    exit 1
+}
+
+# Update State with parsed input configuration
+$script:State.Token = $inputConfig.Token
+$script:State.CheckMinorVersion = ($inputConfig.CheckMinorVersion -ne "none")
+$script:State.CheckReleases = $inputConfig.CheckReleases
+$script:State.CheckImmutability = $inputConfig.CheckReleaseImmutability
+$script:State.CheckMarketplace = $inputConfig.CheckMarketplace
+$script:State.IgnorePreviewReleases = $inputConfig.IgnorePreviewReleases
+$script:State.FloatingVersionsUse = $inputConfig.FloatingVersionsUse
+$script:State.AutoFix = $inputConfig.AutoFix
+$script:State.IgnoreVersions = $inputConfig.IgnoreVersions
+
+# Debug: Show parsed input values
+Write-InputDebugInfo -Config $inputConfig
+
+# Validate inputs
+$validationErrors = Test-ActionInput -Config $inputConfig
+if ($validationErrors.Count -gt 0) {
+    foreach ($validationError in $validationErrors) {
+        Write-Output $validationError
+    }
+    exit 1
+}
+
+# Debug output for repository info
+Write-RepositoryDebugInfo -State $script:State -Config $inputConfig
+
+# Validate token is available for auto-fix mode
+if (-not (Test-AutoFixRequirement -State $script:State -AutoFix $inputConfig.AutoFix)) {
     $global:returnCode = 1
+    exit 1
 }
 
-function write-actions-warning
-{
-    param(
-        [string] $message
-    )
+#############################################################################
+# FETCH REPOSITORY DATA
+# Populate State with tags, branches, releases, and marketplace metadata
+#############################################################################
 
-    write-output $message
+Initialize-RepositoryData -State $script:State `
+    -IgnoreVersions $inputConfig.IgnoreVersions `
+    -CheckMarketplace $inputConfig.CheckMarketplace `
+    -AutoFix $inputConfig.AutoFix `
+    -ScriptRoot $PSScriptRoot
+
+#############################################################################
+# VALIDATION ENGINE (Rule-Based)
+# Execute validation rules to detect issues. Results are stored in State.Issues.
+#############################################################################
+
+Write-Host "##[group]Rule-based Validation Engine"
+
+# Build configuration hashtable from parsed inputs for the rule engine
+$ruleConfig = @{
+    'check-minor-version'          = $inputConfig.CheckMinorVersion
+    'check-releases'               = $inputConfig.CheckReleases
+    'check-release-immutability'   = $inputConfig.CheckReleaseImmutability
+    'check-marketplace'            = $inputConfig.CheckMarketplace
+    'ignore-preview-releases'      = $inputConfig.IgnorePreviewReleases
+    'floating-versions-use'        = $inputConfig.FloatingVersionsUse
+    'auto-fix'                     = $inputConfig.AutoFix
+    'ignore-versions'              = $inputConfig.IgnoreVersions
 }
 
-function ConvertTo-Version
-{
-    param(
-        [string] $value
-    )
+Write-Host "::debug::Rule engine config: $($ruleConfig | ConvertTo-Json -Compress)"
 
-    $dots = $value.Split(".").Count - 1
+# Load and execute validation rules
+$allRules = Get-ValidationRule
+Write-Host "::debug::Loaded $($allRules.Count) validation rules"
 
-    switch ($dots)
-    {
-        0
-        {
-            return [Version]"$value.0.0"
-        }
-        1
-        {
-            return [Version]"$value.0"
-        }
-        2
-        {
-            return [Version]$value
-        }
-    }
-}
-
-foreach ($tag in $tags)
-{
-    $tagVersions += @{
-        version = $tag
-        ref = "refs/tags/$tag"
-        sha = & git rev-list -n 1 $tag
-        semver = ConvertTo-Version $tag.Substring(1)
-    }
-}
-
-$latest = & git tag -l latest
-if ($latest)
-{
-    $latest = @{
-        version = "latest"
-        ref = "refs/tags/latest"
-        sha = & git rev-list -n 1 latest
-        semver = $null
-    }
-}
-
-foreach ($branch in $branches)
-{
-    $branchVersions += @{
-        version = $branch
-        ref = "refs/remotes/origin/$branch"
-        sha = & git rev-parse refs/remotes/origin/$branch
-        semver = ConvertTo-Version $branch.Substring(1)
-    }
-}
-
-foreach ($tagVersion in $tagVersions)
-{
-    $branchVersion = $branchVersions | Where-Object{ $_.version -eq $tagVersion.version } | Select-Object -First 1
-
-    if ($branchVersion)
-    {
-        $message = "title=Ambiguous version: $($tagVersion.version)::Exists as both tag ($($tagVersion.sha)) and branch ($($branchVersion.sha))"
-        if ($branchVersion.sha -eq $tagVersion.sha)
-        {
-            
-            write-actions-warning "::warning $message"
-        }
-        else
-        {
-            write-actions-error "::error $message"
-        }
-
-        $suggestedCommands += "git push origin :refs/heads/$($tagVersion.version)"
-    }
-}
-
-$allVersions = $branchVersions + $tagVersions
-
-$majorVersions = $allVersions | 
-    ForEach-Object{ ConvertTo-Version "$($_.semver.major)" } | 
-    Select-Object -Unique
-
-$minorVersions = $allVersions | 
-    ForEach-Object{ ConvertTo-Version "$($_.semver.major).$($_.semver.minor)" } | 
-    Select-Object -Unique
-
-$patchVersions = $allVersions | 
-    ForEach-Object{ ConvertTo-Version "$($_.semver.major).$($_.semver.minor).$($_.semver.build)" } | 
-    Select-Object -Unique
-
-foreach ($majorVersion in $majorVersions)
-{
-    $highestMinor = ($minorVersions | Where-Object{ $_.major -eq $majorVersion.major } | Measure-Object -Max).Maximum
-
-    $majorSha = ($allVersions | 
-        Where-Object{ $_.version -eq "v$($majorVersion.major)" } | 
-        Select-Object -First 1).sha
-
-    $minorSha = ($allVersions | 
-        Where-Object{ $_.version -eq "v$($majorVersion.major).$($highestMinor.minor)" } | 
-        Select-Object -First 1).sha
-
-    if ($warnMinor)
-    {
-        if (-not $majorSha -and $minorSha)
-        {
-            write-actions-error "::error title=Missing version::Version: v$($majorVersion.major) does not exist and must match: v$($highestMinor.major).$($highestMinor.minor) ref $minorSha"
-            $suggestedCommands += "git push origin $minorSha`:refs/tags/v$($majorVersion.major)"
-        }
-
-        if ($minorSha -and ($majorSha -ne $minorSha))
-        {
-            write-actions-error "::error title=Incorrect version::Version: v$($majorVersion.major) ref $majorSha must match: v$($highestMinor.major).$($highestMinor.minor) ref $minorSha"
-            $suggestedCommands += "git push origin $minorSha`:refs/tags/v$($majorVersion.major) --force"
-        }
-    }
-
-    $highestPatch = ($patchVersions | 
-        Where-Object{ $_.major -eq $highestMinor.major -and $_.minor -eq $highestMinor.minor } | 
-        Measure-Object -Max).Maximum
+if ($allRules.Count -gt 0) {
+    # Execute rules directly on $script:State - issues are added to State.Issues
+    $ruleIssues = Invoke-ValidationRule -State $script:State -Config $ruleConfig -Rules $allRules
     
-    $majorSha = ($allVersions | 
-        Where-Object{ $_.version -eq "v$($highestMinor.major)" } | 
-        Select-Object -First 1).sha
-    $minorSha = ($allVersions | 
-        Where-Object{ $_.version -eq "v$($highestMinor.major).$($highestMinor.minor)" } | 
-        Select-Object -First 1).sha
-    $patchSha = ($allVersions | 
-        Where-Object{ $_.version -eq "v$($highestPatch.major).$($highestPatch.minor).$($highestPatch.build)" } | 
-        Select-Object -First 1).sha
+    Write-Host "::debug::Rule engine found $($ruleIssues.Count) issues"
     
-    if ($majorSha -and $patchSha -and ($majorSha -ne $patchSha))
-    {
-        write-actions-error "::error title=Incorrect version::Version: v$($highestMinor.major) ref $majorSha must match: v$($highestPatch.major).$($highestPatch.minor).$($highestPatch.build) ref $patchSha"
-        $suggestedCommands += "git push origin $patchSha`:refs/tags/v$($majorVersion.major) --force"
-    }
-
-    if (-not $patchSha -and $majorSha)
-    {
-        write-actions-error "::error title=Missing version::Version: v$($highestPatch.major).$($highestPatch.minor).$($highestPatch.build) does not exist and must match: v$($highestPatch.major) ref $majorSha"
-        $suggestedCommands += "git push origin $majorSha`:refs/tags/v$($highestPatch.major).$($highestPatch.minor).$($highestPatch.build)"
-    }
-
-    if (-not $majorSha)
-    {
-        write-actions-error "::error title=Missing version::Version: v$($majorVersion.major) does not exist and must match: v$($highestPatch.major).$($highestPatch.minor).$($highestPatch.build) ref $patchSha"
-        $suggestedCommands += "git push origin $patchSha`:refs/tags/v$($highestPatch.major)"
-    }
-
-    if ($warnMinor)
-    {
-        if (-not $minorSha)
-        {
-            write-actions-error "::error title=Missing version::Version: v$($highestMinor.major).$($highestMinor.minor) does not exist must match: v$($highestPatch.major).$($highestPatch.minor).$($highestPatch.build) ref $patchSha"
-            $suggestedCommands += "git push origin $patchSha`:refs/tags/v$($highestMinor.major).$($highestMinor.minor)"
-        }
-
-        if ($minorSha -and ($minorSha -ne $patchSha))
-        {
-            write-actions-error "::error title=Incorrect version::Version: v$($highestMinor.major).$($highestMinor.minor) ref $minorSha must match: v$($highestPatch.major).$($highestPatch.minor).$($highestPatch.build) ref $patchSha"
-            $suggestedCommands += "git push origin $patchSha`:refs/tags/v$($highestMinor.major).$($highestMinor.minor) --force"
+    # Log rule engine results
+    if ($ruleIssues.Count -gt 0) {
+        Write-Host "::debug::=== Rule Engine Issues ==="
+        foreach ($issue in $ruleIssues) {
+            Write-Host "::debug::  [$($issue.Type)] $($issue.Version): $($issue.Message)"
         }
     }
 }
 
-$highestVersion = ($allVersions | 
-    ForEach-Object{ ConvertTo-Version "$($_.semver.major).$($_.semver.minor).$($_.semver.build)" } | 
-    Select-Object -Unique | 
-    Measure-Object -Max).Maximum
+Write-Host "##[endgroup]"
 
-$highestVersion = $allVersions | 
-    Where-Object{ $_.version -eq "v$($highestPatch.major).$($highestPatch.minor).$($highestPatch.build)" } | 
-    Select-Object -First 1 
+#############################################################################
+# AUTO-FIX EXECUTION
+#############################################################################
 
-if ($latest -and($latest.sha -ne $highestVersion.sha))
-{
-    write-actions-error "::error title=Incorrect version::Version: latest ref $($latest.sha) must match: v$($highestPatch.major).$($highestPatch.minor).$($highestPatch.build) ref $($highestVersion.sha)"
-    $suggestedCommands += "git push origin $($highestVersion.sha):latest --force"
+# Now execute all auto-fixes (or mark as unfixable when auto-fix is disabled)
+if ($inputConfig.AutoFix -and $State.Issues.Count -gt 0) {
+    Write-Host "##[group]Verifying potential solutions"
+}
+Invoke-AutoFix -State $State -AutoFix $inputConfig.AutoFix
+if ($inputConfig.AutoFix -and $State.Issues.Count -gt 0) {
+    Write-Host "##[endgroup]"
 }
 
-if ($suggestedCommands -ne "")
+#############################################################################
+# LOG UNRESOLVED ISSUES
+#############################################################################
+
+# Log all unresolved issues (failed or unfixable) as errors/warnings
+# This happens AFTER autofix completes, regardless of whether autofix is enabled
+Write-UnresolvedIssue -State $State
+
+#############################################################################
+# FINAL SUMMARY AND EXIT
+#############################################################################
+
+# Display summary based on auto-fix mode
+$exitCode = $State.GetReturnCode()
+
+if ($inputConfig.AutoFix)
 {
-    $suggestedCommands = $suggestedCommands | Select-Object -unique
-    Write-Output ($suggestedCommands -join "`n")
-    write-output "### Suggested fix:`n```````n$($suggestedCommands -join "`n")`n``````" >> $env:GITHUB_STEP_SUMMARY
+    Write-Output ""
+    Write-Output "### Auto-fix Summary"
+    Write-Output "✓ Fixed issues: $($State.GetFixedIssuesCount())"
+    Write-Output "✗ Failed fixes: $($State.GetFailedFixesCount())"
+    Write-Output "⚠ Manual fix required: $($State.GetManualFixRequiredCount())"
+    Write-Output "⛔ Unfixable issues: $($State.GetUnfixableIssuesCount())"
+    
+    # Only fail if there are ERROR-severity issues that are failed, manual fixes required, or unfixable
+    # Warning-severity issues should not cause failure even with auto-fix
+    $errorFailedCount = ($State.Issues | Where-Object { $_.Severity -eq "error" -and $_.Status -eq "failed" }).Count
+    $errorManualFixCount = ($State.Issues | Where-Object { $_.Severity -eq "error" -and $_.Status -eq "manual_fix_required" }).Count
+    $errorUnfixableCount = ($State.Issues | Where-Object { $_.Severity -eq "error" -and $_.Status -eq "unfixable" }).Count
+    
+    if ($errorFailedCount -gt 0 -or $errorManualFixCount -gt 0 -or $errorUnfixableCount -gt 0)
+    {
+        $exitCode = 1
+        Write-Output ""
+        if ($errorManualFixCount -gt 0) {
+            Write-Output "::error::Some issues require manual intervention (e.g., workflow permission issues). Please fix manually."
+        }
+        if ($errorUnfixableCount -gt 0) {
+            Write-Output "::error::Some issues cannot be fixed (e.g., immutable release conflicts). Consider adding affected versions to the ignore-versions list."
+        }
+    }
+    elseif ($State.GetFixedIssuesCount() -gt 0)
+    {
+        # Issues were found and all were fixed successfully
+        Write-Output ""
+        Write-Output "::notice::All issues were successfully fixed!"
+    }
+    elseif ($State.GetManualFixRequiredCount() -gt 0 -or $State.GetUnfixableIssuesCount() -gt 0)
+    {
+        # Only warning-severity issues remain that need manual attention
+        Write-Output ""
+        Write-Output "::notice::Some warning-level issues require manual attention. See remediation steps below."
+    }
+    else
+    {
+        # No issues were found
+        Write-Output ""
+        Write-Output "::notice::No issues found!"
+    }
+    
+    # Use new function to show manual remediation instructions
+    Get-ManualInstruction -State $State -GroupByType $false
+    Write-ManualInstructionsToStepSummary -State $State
+}
+else
+{
+    # Not in auto-fix mode, show manual instructions for all issues
+    Get-ManualInstruction -State $State -GroupByType $false
+    Write-ManualInstructionsToStepSummary -State $State
 }
 
-exit $global:returnCode
+# Set globals for test harness compatibility and exit
+$global:returnCode = $exitCode
+$global:State = $script:State  # Make State accessible to tests
+
+exit $exitCode
+
