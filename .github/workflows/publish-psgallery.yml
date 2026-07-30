@@ -15,7 +15,12 @@ jobs:
     environment: powershell-gallery
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Extract version from tag
         id: version
@@ -31,18 +36,18 @@ jobs:
         run: |
           $manifestPath = './GitHubActionVersioning.psd1'
           $version = '${{ steps.version.outputs.version }}'
-          
+
           # Read the manifest content
           $content = Get-Content -Path $manifestPath -Raw
-          
+
           # Update the ModuleVersion
           $content = $content -replace "ModuleVersion\s*=\s*'[^']*'", "ModuleVersion     = '$version'"
-          
+
           # Write the updated content back
           Set-Content -Path $manifestPath -Value $content -NoNewline
-          
+
           Write-Output "Updated module version to: $version"
-          
+
           # Verify the update
           $manifest = Test-ModuleManifest -Path $manifestPath
           Write-Output "Manifest version: $($manifest.Version)"
@@ -50,7 +55,8 @@ jobs:
       - name: Run tests before publishing
         shell: pwsh
         run: |
-          $config = New-PesterConfiguration
+          Import-Module Pester -ErrorAction Stop
+          $config = [PesterConfiguration](Import-PowerShellDataFile -Path './pester.config.psd1')
           $config.Run.Path = @(
             './tests/unit/**/*.Tests.ps1'
             './tests/cli/**/*.Tests.ps1'
@@ -65,13 +71,13 @@ jobs:
           # Create a staging folder with the module name (required by Publish-Module)
           $stagingPath = './publish/GitHubActionVersioning'
           New-Item -Path $stagingPath -ItemType Directory -Force | Out-Null
-          
+
           # Copy module files to the staging folder
           Copy-Item -Path './GitHubActionVersioning.psd1' -Destination $stagingPath
           Copy-Item -Path './GitHubActionVersioning.psm1' -Destination $stagingPath
           Copy-Item -Path './lib' -Destination $stagingPath -Recurse
           Copy-Item -Path './module' -Destination $stagingPath -Recurse
-          
+
           Write-Output "Module staged at: $stagingPath"
           Get-ChildItem -Path $stagingPath -Recurse | Select-Object FullName
 
@@ -84,7 +90,7 @@ jobs:
             Write-Error "PSGALLERY_API_KEY secret is not set"
             exit 1
           }
-          
+
           # Publish the module from the staging folder
           $publishParams = @{
             Path        = './publish/GitHubActionVersioning'
@@ -92,7 +98,7 @@ jobs:
             Repository  = 'PSGallery'
             Verbose     = $true
           }
-          
+
           Publish-Module @publishParams
-          
+
           Write-Output "Successfully published GitHubActionVersioning module to PowerShell Gallery"
