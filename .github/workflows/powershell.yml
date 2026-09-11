@@ -32,31 +32,46 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@v2.21.0
+        uses: step-security/harden-runner@v2.21.1
         with:
           egress-policy: audit
 
       - uses: actions/checkout@v7.0.1
 
       - name: Install PSScriptAnalyzer and ConvertToSARIF
-        shell: pwsh
+        shell: pwsh -NoProfile -Command ". '{0}'"
         run: |
-          # Install modules in CurrentUser scope to avoid permission issues
-          # Use -Force and -AllowClobber to ensure clean installation
+          # GitHub-hosted runners load PSScriptAnalyzer 1.25.x (currently)
+          # into the session automatically via the runner's default
+          # PowerShell profile (used for predictive IntelliSense). That
+          # keeps a lock on the module files ("currently in use") and can
+          # leave two different PSScriptAnalyzer assembly versions loaded
+          # in the same session, which is what caused the earlier
+          # NullReferenceException/"Get-Command not recognized" crash.
+          # Running this step (and the analysis step) with `-NoProfile`
+          # prevents that auto-import so only our pinned 1.24.0 is ever
+          # loaded.
           Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.24.0 -Force -Scope CurrentUser -AllowClobber
           Install-Module -Name ConvertToSARIF -Force -Scope CurrentUser -AllowClobber
           
-          # Verify installation
+          # Verify installation - only 1.24.0 should be listed for PSScriptAnalyzer
           Get-Module -ListAvailable -Name PSScriptAnalyzer, ConvertToSARIF | 
-            Select-Object Name, Version | 
+            Select-Object Name, Version, ModuleBase | 
             Format-Table -AutoSize
 
       - name: Run PSScriptAnalyzer
-        shell: pwsh
+        shell: pwsh -NoProfile -Command ". '{0}'"
         run: |
           # Import modules explicitly in fresh session
           Import-Module -Name PSScriptAnalyzer -RequiredVersion 1.24.0 -Force
           Import-Module -Name ConvertToSARIF -Force
+
+          # Fail fast if the wrong version got loaded (e.g. a pre-installed
+          # copy on the runner image was not fully removed)
+          $loadedVersion = (Get-Module -Name PSScriptAnalyzer).Version
+          if ($loadedVersion -ne [version]'1.24.0') {
+            throw "Expected PSScriptAnalyzer 1.24.0 to be loaded, but found $loadedVersion"
+          }
           
           # Run analysis and generate SARIF
           $results = Invoke-ScriptAnalyzer -Path './' -Recurse -Settings 'PSScriptAnalyzerSettings.psd1'
@@ -105,6 +120,6 @@ jobs:
 
       # Upload the SARIF file generated in the previous step
       - name: Upload SARIF results file
-        uses: github/codeql-action/upload-sarif@v4.37.7
+        uses: github/codeql-action/upload-sarif@v4.38.0
         with:
           sarif_file: results.sarif

@@ -64,7 +64,7 @@ Describe "CreateReleaseAction" {
             $commands[0] | Should -Not -Match "^#"
         }
         
-        It "Should return empty array when issue is unfixable" {
+        It "Should return an ignore-versions YAML snippet (not a gh command) when issue is unfixable" {
             # Create unfixable issue
             $action = [CreateReleaseAction]::new("v1.0.0", $false)
             $issue = [ValidationIssue]::new("missing_release", "error", "Release missing")
@@ -74,7 +74,10 @@ Describe "CreateReleaseAction" {
             
             $commands = $action.GetManualCommands($script:state)
             
-            $commands.Count | Should -Be 0
+            $commands.Count | Should -BeGreaterThan 0
+            ($commands -join "`n") | Should -Match 'ignore-versions:\s*"v1\.0\.0"'
+            ($commands -join "`n") | Should -Not -Match "gh release"
+            $action.ManualCommandsLanguage | Should -Be "yaml"
         }
     }
     
@@ -115,6 +118,22 @@ Describe "CreateReleaseAction" {
             $result | Should -Be $false
             $issue.Status | Should -Be "unfixable"
             $issue.Message | Should -Match "immutable release"
+        }
+
+        It "Should include the suggested new ignore-versions value, preserving existing wildcard patterns, on 422 error" {
+            Mock New-GitHubRelease { return @{ Success = $false; Unfixable = $true } }
+
+            $script:state.IgnoreVersions = @("v1.*", "v2.0.0")
+
+            $action = [CreateReleaseAction]::new("v3.0.0", $false)
+            $issue = [ValidationIssue]::new("missing_release", "error", "Release missing")
+            $issue.Version = "v3.0.0"
+            $issue.Status = "pending"
+            $script:state.Issues = @($issue)
+
+            $action.Execute($script:state)
+
+            $issue.Message | Should -Match ([regex]::Escape('"v1.*,v2.0.0,v3.0.0"'))
         }
     }
     

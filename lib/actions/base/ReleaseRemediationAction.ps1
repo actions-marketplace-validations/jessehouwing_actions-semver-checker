@@ -17,6 +17,36 @@ class ReleaseRemediationAction : RemediationAction {
         return $result.ContainsKey('Unfixable') -and $result.Unfixable -eq $true
     }
     
+    # Helper method to build the suggested new ignore-versions value to paste back
+    # into the input: the original configured list (preserving any wildcard
+    # patterns such as "v1.*" exactly as configured) plus this action's TagName,
+    # deduplicated and comma-separated.
+    hidden [string] GetSuggestedIgnoreVersions([RepositoryState]$state) {
+        $current = @()
+        if ($state.IgnoreVersions) {
+            $current = @($state.IgnoreVersions | Where-Object { $_ })
+        }
+
+        $updated = @($current + $this.TagName) | Select-Object -Unique
+
+        return ($updated -join ",")
+    }
+
+    # Helper method to build a copy/pasteable YAML snippet showing the updated
+    # ignore-versions input, ready to drop into the workflow file that calls
+    # this action. Also switches ManualCommandsLanguage to "yaml" so the
+    # snippet is rendered with a ```yaml fence instead of ```bash.
+    hidden [string[]] GetIgnoreVersionsYamlSnippet([RepositoryState]$state) {
+        $this.ManualCommandsLanguage = "yaml"
+        $suggestedIgnoreVersions = $this.GetSuggestedIgnoreVersions($state)
+
+        return @(
+            "# Update your workflow step to skip this locked version:"
+            "with:"
+            "  ignore-versions: `"$suggestedIgnoreVersions`""
+        )
+    }
+
     # Helper method to mark an issue as unfixable
     hidden [void] MarkAsUnfixable([RepositoryState]$state, [string]$issueType, [string]$message) {
         Write-Host "✗ Unfixable: $message"
